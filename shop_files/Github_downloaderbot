@@ -1,0 +1,223 @@
+import logging
+import re
+import os
+import httpx
+import base64
+import html
+import hashlib
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+logging.basicConfig(level=logging.INFO)
+
+TOKEN = "BOT TOKEN QO'YING"
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+GITHUB_REPO_RE = re.compile(r"https?://github\.com/([^/]+)/([^/]+)/?")
+
+CALLBACK_CACHE = {}
+
+def create_callback_data(prefix, owner, repo, path=""):
+    data = f"{prefix}:{owner}:{repo}:{path}"
+    if len(data.encode()) <= 64:
+        return data
+    key = hashlib.md5(data.encode()).hexdigest()[:16]
+    CALLBACK_CACHE[key] = data
+    if len(CALLBACK_CACHE) > 1000:
+        CALLBACK_CACHE.clear()
+    return f"c:{key}"
+
+def resolve_callback_data(data):
+    if data.startswith("c:"):
+        key = data.split(":")[1]
+        return CALLBACK_CACHE.get(key)
+    return data
+
+async def safe_edit_or_answer(callback, text, keyboard=None, parse_mode="HTML"):
+    kb = keyboard.as_markup() if hasattr(keyboard, 'as_markup') else keyboard
+    if callback.message.photo or callback.message.animation or callback.message.document:
+        await callback.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+        try: await callback.message.delete()
+        except: pass
+    else:
+        try:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode=parse_mode)
+        except:
+            await callback.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+            try: await callback.message.delete()
+            except: pass
+
+async def show_main_menu(callback_or_message, owner, repo):
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="📦 ZIP yuklab olish", callback_data=create_callback_data("zip", owner, repo)))
+    keyboard.row(InlineKeyboardButton(text="📁 Fayllarni ko'rish", callback_data=create_callback_data("browse", owner, repo, "")))
+    keyboard.row(InlineKeyboardButton(text="🌳 Daraxt (Tree) ko'rinishi", callback_data=create_callback_data("tree", owner, repo)))
+    
+    text = f"📊 <b>Repozitoriya:</b> {html.escape(owner)}/{html.escape(repo)}\nTanlang:"
+    
+    if isinstance(callback_or_message, types.Message):
+        await callback_or_message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+    else:
+        await safe_edit_or_answer(callback_or_message, text, keyboard)
+
+@dp.message(Command("start"))
+async def start_handler(message: types.Message):
+    await message.answer(
+        "Salom! Menga GitHub repozitoriyasi linkini yuboring.\n\n"
+        "📦 <b>ZIP yuklab olish</b>\n"
+        "📁 <b>Fayllarni ko'rish</b>\n"
+        "🖼 <b>Rasm va GIFlarni ko'rish</b>\n"
+        "🌳 <b>Struktura (Tree) ko'rish</b>",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text.contains("github.com"))
+async def handle_github_link(message: types.Message):
+    match = GITHUB_REPO_RE.search(message.text)
+    if not match:
+        await message.answer("Iltimos, to'g'ri GitHub repozitoriya linkini yuboring.")
+        return
+
+    owner = match.group(1).replace(".git", "")
+    repo = match.group(2).replace(".git", "")
+    repo = repo.split('/')[0]
+
+    await show_main_menu(message, owner, repo)
+
+@dp.callback_query()
+async def global_callback_handler(callback: types.CallbackQuery):
+    raw_data = resolve_callback_data(callback.data)
+    if not raw_data:
+        await callback.answer("Sessiya muddati tugagan. Linkni qaytadan yuboring.", show_alert=True)
+        return
+
+    parts = raw_data.split(":")
+    if len(parts) < 3: return
+
+    action, owner, repo = parts[0], parts[1], parts[2]
+    path = ":".join(parts[3:]) if len(parts) > 3 else ""
+
+    try:
+        if action == "zip":
+            await download_zip(callback, owner, repo)
+        elif action == "browse":
+            await browse_repo(callback, owner, repo, path)
+        elif action == "tree":
+            await view_tree_structure(callback, owner, repo)
+        elif action == "menu":
+            await show_main_menu(callback, owner, repo)
+    except Exception as e:
+        logging.error(f"Error in {action}: {e}")
+        await callback.answer(f"Xatolik: {str(e)[:50]}", show_alert=True)
+
+async def download_zip(callback, owner, repo):
+    status_msg = await callback.message.answer(f"⏳ {html.escape(repo)} ZIP tayyorlanmoqda...")
+    zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball"
+    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+        try:
+            response = await client.get(zip_url)
+            if response.status_code == 200:
+                zip_file = BufferedInputFile(response.content, filename=f"{repo}.zip")
+                await callback.message.answer_document(zip_file, caption=f"✅ {owner}/{repo} tayyor!")
+                await status_msg.delete()
+            else:
+                kb = InlineKeyboardBuilder()
+                kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=create_callback_data("menu", owner, repo)))
+                await status_msg.edit_text(f"❌ Xatolik ({response.status_code})", reply_markup=kb.as_markup())
+        except Exception as e:
+            kb = InlineKeyboardBuilder()
+            kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=create_callback_data("menu", owner, repo)))
+            await status_msg.edit_text(f"❌ Xatolik: {str(e)[:50]}", reply_markup=kb.as_markup())
+
+async def browse_repo(callback, owner, repo, path):
+    await callback.answer("Yuklanmoqda...")
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(api_url)
+        if response.status_code != 200:
+            await callback.answer("Ma'lumot olib bo'lmadi", show_alert=True)
+            return
+            
+        contents = response.json()
+        keyboard = InlineKeyboardBuilder()
+        parent_path = "/".join(path.split("/")[:-1])
+        
+        if isinstance(contents, dict) and contents.get("type") == "file":
+            filename = contents.get("name", "").lower()
+            img_ext = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico')
+            keyboard.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=create_callback_data("browse", owner, repo, parent_path)))
+            
+            if filename.endswith(img_ext):
+                status = await callback.message.answer("⏳ Media yuklanmoqda...")
+                async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as mc:
+                    res = await mc.get(contents.get("download_url"))
+                    if res.status_code == 200:
+                        file = BufferedInputFile(res.content, filename=contents.get("name"))
+                        cap = f"🖼 <b>Fayl:</b> <code>{html.escape(contents.get('name'))}</code>"
+                        if filename.endswith('.gif'): await callback.message.answer_animation(file, caption=cap, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+                        else: await callback.message.answer_photo(file, caption=cap, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+                        await status.delete()
+                        try: await callback.message.delete()
+                        except: pass
+                    else: await status.edit_text("❌ Media xatosi")
+                return
+
+            content = base64.b64decode(contents.get("content", "")).decode('utf-8', errors='ignore')
+            if len(content) > 3500: content = content[:3500] + "\n\n...(davomi bor)..."
+            text = f"📄 <b>Fayl:</b> <code>{html.escape(contents.get('name'))}</code>\n\n<pre>{html.escape(content)}</pre>"
+            await callback.message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+            try: await callback.message.delete()
+            except: pass
+            return
+
+        if isinstance(contents, list):
+            contents.sort(key=lambda x: (x['type'] != 'dir', x['name']))
+            for item in contents[:50]:
+                icon = "📁" if item["type"] == "dir" else "📄"
+                if item["name"].lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')): icon = "🖼"
+                keyboard.row(InlineKeyboardButton(text=f"{icon} {item['name']}", callback_data=create_callback_data("browse", owner, repo, item['path'])))
+            
+            if path: keyboard.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=create_callback_data("browse", owner, repo, parent_path)))
+            else: keyboard.row(InlineKeyboardButton(text="⬅️ Orqaga (Asosiy menyu)", callback_data=create_callback_data("menu", owner, repo)))
+            
+            keyboard.row(InlineKeyboardButton(text="📦 ZIP yuklash", callback_data=create_callback_data("zip", owner, repo)))
+            text = f"📁 <b>Manzil:</b> <code>{html.escape(path or 'Root')}</code>\n\nFaylni tanlang:"
+            await safe_edit_or_answer(callback, text, keyboard)
+
+async def view_tree_structure(callback, owner, repo):
+    status = await callback.message.answer(f"⏳ {repo} strukturasi...")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
+        if r.status_code != 200: return await status.edit_text("Xato!")
+        
+        branch = r.json().get("default_branch", "main")
+        t = await client.get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1")
+        if t.status_code == 200:
+            tree_str = f"🌳 {repo} ({branch})\n"
+            for item in t.json().get("tree", [])[:100]:
+                parts = item["path"].split("/")
+                icon = "📁" if item["type"] == "tree" else "📄"
+                if item["path"].lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')): icon = "🖼"
+                tree_str += f"{'  ' * (len(parts)-1)}{icon} {parts[-1]}\n"
+            
+            kb = InlineKeyboardBuilder()
+            kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=create_callback_data("menu", owner, repo)))
+            await callback.message.answer(f"<pre>{html.escape(tree_str)}</pre>", reply_markup=kb.as_markup(), parse_mode="HTML")
+            await status.delete()
+            try: await callback.message.delete()
+            except: pass
+        else: await status.edit_text("Tree xatosi")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    try: asyncio.run(main())
+    except: logging.info("To'xtatildi")
+    
